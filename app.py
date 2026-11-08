@@ -5,26 +5,25 @@ import threading
 import unicodedata
 import requests
 from datetime import datetime
-from urllib.parse import urlparse
 from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
 # =====================================================================
-# 🔧 DEFAULT KONFIGURACIJA (Može se mijenjati i na Web interfejsu)
+# 🔧 DEFAULT KONFIGURACIJA
 # =====================================================================
 DEFAULT_APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "apify_api_envhGdMaylNtuuVIfDHGHc946c7uOu1pBsiC")
 DEFAULT_PANEL_URL = os.environ.get("PANEL_URL", "https://godofpanel.com/api/v2")
 DEFAULT_API_KEY = os.environ.get("API_KEY", "c4868df4a78299b800d222cd9478ba17")
-DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")  # Upiši ID za Comment Likes na SMMFrog
+DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")
 
 # Pravila za lajkove
 MULTIPLIER = 1.30           # Šalje 1.3x više lajkova od top komentara
-MAX_TOP_LIKES_LIMIT = 15000 # Ako prvi komentar ima preko 15.000 lajkova, preskače video i ne šalje ništa
+MAX_TOP_LIKES_LIMIT = 15000 # Ako prvi komentar ima preko 15.000 lajkova, ne šalje ništa
 FALLBACK_MIN_LIKES = 25     # Ako top komentar ima 0 lajkova, pošalji 25
-MAX_PAGES_PER_VIDEO = 10    # Maksimalno stranica po videu (Apify ScrapTik)
+MAX_PAGES_PER_VIDEO = 10    # Maksimalno stranica po videu (do 500 komentara)
 
-# Korijeni riječi (nakon što filter skine sve tačkice, razmake, nevidljive znakove i ćirilicu)
+# Korijeni riječi (nakon čišćenja nevidljivih znakova, tačkica i ćirilice)
 CLEAN_ROOT_PATTERNS = [
     "alverset",      # Hvata: Alversett, Alverset, AIversett, Alver.sett, Alversettte, Alversette...
     "noraalver",     # Hvata: Nora Alversett, Nora.Alversett, N. Alversett...
@@ -43,7 +42,6 @@ DESKTOP_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Globalno stanje i red čekanja
 queue_lock = threading.Lock()
 order_queue = []
 log_lines = []
@@ -62,19 +60,10 @@ def add_log(msg: str):
 
 
 def normalize_camouflaged_text(text: str) -> str:
-    """
-    ULTIMATIVNI DEKODER KAMUFLAŽE:
-    1. Briše sve nevidljive (zero-width / control / format) karaktere.
-    2. Pretvara sva ćirilična, grčka i brojčana lookalike slova (homoglife) u običnu latinicu.
-    3. Briše tačkice, crtice i specijalne znakove kako bi spojio razdvojene riječi.
-    """
+    """Skida sve nevidljive (zero-width) znakove, tačkice i pretvara ćirilicu/homoglife u latinicu."""
     if not text:
         return ""
-
-    # 1. Ukloni sve nevidljive (zero-width / control) karaktere
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
-
-    # 2. Mapa svih mogućih lookalike slova (ćirilica, grčki, brojevi, veliko I)
     homoglyphs = {
         "е": "e", "Е": "e", "ё": "e", "Ё": "e",
         "а": "a", "А": "a", "α": "a", "Α": "a",
@@ -94,21 +83,15 @@ def normalize_camouflaged_text(text: str) -> str:
     for fake, real in homoglyphs.items():
         text = text.replace(fake, real)
 
-    text_lower = text.lower()
-
-    # 3. Ostavi samo čista latinična slova a-z (briše tačkice, crtice i razmake)
-    clean_compact = re.sub(r"[^a-z]", "", text_lower)
-    return clean_compact
+    return re.sub(r"[^a-z]", "", text.lower())
 
 
 def is_our_comment(text: str) -> bool:
-    """Provjerava da li očišćeni tekst sadrži bilo koji korijen naših ključnih riječi."""
     clean_compact = normalize_camouflaged_text(text)
     return any(root in clean_compact for root in CLEAN_ROOT_PATTERNS)
 
 
 def resolve_tiktok_url_and_id(raw_url: str):
-    """Pretvara mobilni/skraćeni link u čisti PC link i izvlači 19-cifreni Video ID."""
     url = (raw_url or "").strip()
     if not url:
         return None, ""
@@ -139,90 +122,165 @@ def resolve_tiktok_url_and_id(raw_url: str):
     return None, resolved_url.split("?")[0]
 
 
-def fetch_comments_scraptik(video_id: str, video_url: str, apify_token: str):
+def extract_comments_from_nested_json(data):
     """
-    Poziva Apify ScrapTik API (scraptik~tiktok-api ili scraptik~tiktok-comments-scraper).
-    Koristi Early-Stop: čim nađe komentar sa keywordom + replyem, a već ima 1. stranicu
-    (gdje je najjači komentar), odmah staje da ti uštedi Apify kredit!
+    Rekurzivno pronalazi sve objekte komentara bez obzira kako ih je Apify actor zapakovao.
+    """
+    found = []
+    has_more = False
+    next_cursor = None
+
+    if isinstance(data, list):
+        for item in data:
+            c_list, hm, nc = extract_comments_from_nested_json(item)
+            found.extend(c_list)
+            if hm:
+                has_more = True
+            if nc is not None:
+                next_cursor = nc
+    elif isinstance(data, dict):
+        # Ako je sam dict zapravo komentar
+        if ("text" in data or "comment" in data) and (
+            "digg_count" in data or "diggCount" in data or "cid" in data or "user" in data
+        ):
+            found.append(data)
+
+        if data.get("has_more") in (1, True) or data.get("hasMore") is True:
+            has_more = True
+        if "cursor" in data and isinstance(data["cursor"], int):
+            next_cursor = data["cursor"]
+
+        # Pretraži pod-ključeve
+        for key in ("comments", "data", "items", "result", "results", "comment_list"):
+            if key in data and isinstance(data[key], (list, dict)):
+                c_list, hm, nc = extract_comments_from_nested_json(data[key])
+                found.extend(c_list)
+                if hm:
+                    has_more = True
+                if nc is not None:
+                    next_cursor = nc
+
+    return found, has_more, next_cursor
+
+
+def fetch_comments_via_apify_or_fallback(video_id: str, video_url: str, apify_token: str):
+    """
+    1. Pokušava Apify ScrapTik (sa svim varijantama input polja: comments_getComments=True, aweme_id, videoUrl).
+    2. Ako Apify vrati prazno (npr. pogrešan actor ili potrošen free limit), automatski prelazi na
+       direktni TikWM API kako nijedan video ne bi propao!
     """
     all_comments = []
     cursor = 0
 
+    # --- KORAK 1: APIFY SCRAPTIK ---
+    if apify_token:
+        actors_to_try = [
+            "scraptik~tiktok-comments-scraper",
+            "scraptik~tiktok-api",
+        ]
+        for actor_id in actors_to_try:
+            cursor = 0
+            actor_worked = False
+            for page in range(1, MAX_PAGES_PER_VIDEO + 1):
+                endpoint = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
+                # Šaljemo sva polja koja različite verzije ScrapTik actora traže
+                payload = {
+                    "comments_getComments": True,
+                    "comments_awemeId": str(video_id),
+                    "comments_count": 50,
+                    "comments_cursor": cursor,
+                    "aweme_id": str(video_id),
+                    "video_id": str(video_id),
+                    "videoId": str(video_id),
+                    "url": video_url,
+                    "videoUrl": video_url,
+                    "postURLs": [video_url],
+                    "count": 50,
+                    "maxComments": 200,
+                    "cursor": cursor,
+                }
+                try:
+                    res = requests.post(
+                        endpoint,
+                        params={"token": apify_token},
+                        json=payload,
+                        timeout=55
+                    )
+                    if res.status_code not in (200, 201):
+                        if page == 1:
+                            add_log(f"ℹ️ Apify ({actor_id}) status {res.status_code}: {res.text[:140]}")
+                        break
+
+                    raw_json = res.json()
+                    page_comments, has_more, next_cursor = extract_comments_from_nested_json(raw_json)
+
+                    if not page_comments:
+                        if page == 1 and raw_json:
+                            add_log(f"ℹ️ Apify ({actor_id}) vratio neočekivan format: {str(raw_json)[:160]}")
+                        break
+
+                    actor_worked = True
+                    all_comments.extend(page_comments)
+
+                    # Early-Stop: ako smo već našli naš komentar SA REPLYEM, stani odmah!
+                    found_with_reply = any(
+                        is_our_comment(str(c.get("text", c.get("comment", "")) or "")) and
+                        int(c.get("reply_comment_total", c.get("reply_total", c.get("replyCount", 0))) or 0) > 0
+                        for c in all_comments
+                    )
+                    if found_with_reply:
+                        return all_comments, f"Apify ({actor_id})"
+
+                    # Ako je actor već vratio 100+ komentara u jednom cugu (npr. comments-scraper)
+                    if len(page_comments) > 55 or not has_more:
+                        break
+                    cursor = next_cursor if next_cursor is not None else (cursor + 50)
+
+                except Exception as e:
+                    add_log(f"⚠️ Apify ({actor_id}) greška: {e}")
+                    break
+
+            if actor_worked and all_comments:
+                return all_comments, f"Apify ({actor_id})"
+
+    # --- KORAK 2: AUTOMATSKI REZERVNI ENGINE (TikWM Public API) ---
+    # Ako Apify vrati 0 komentara, ovaj rezervni sistem besplatno izvlači komentare da skripta nikad ne stane!
+    add_log("🔄 Apify nije vratio komentare — aktiviram rezervni direktni skener (TikWM)...")
+    cursor = 0
     for page in range(1, MAX_PAGES_PER_VIDEO + 1):
-        endpoint = "https://api.apify.com/v2/acts/scraptik~tiktok-api/run-sync-get-dataset-items"
-        payload = {
-            "post_awemeId": str(video_id),
-            "comments_awemeId": str(video_id),
-            "comments_count": 50,
-            "comments_cursor": cursor,
-            "url": video_url,
-            "aweme_id": str(video_id),
-            "count": 50,
-            "cursor": cursor
-        }
-
         try:
-            res = requests.post(
-                endpoint,
-                params={"token": apify_token},
-                json=payload,
-                timeout=45
+            res = requests.get(
+                "https://www.tikwm.com/api/comment/list",
+                params={"url": video_url, "count": 50, "cursor": cursor},
+                headers=DESKTOP_HEADERS,
+                timeout=15
             )
-
-            # Fallback ako koristiš dedikovani scraptik~tiktok-comments-scraper actor
-            if res.status_code == 404:
-                endpoint_alt = "https://api.apify.com/v2/acts/scraptik~tiktok-comments-scraper/run-sync-get-dataset-items"
-                res = requests.post(
-                    endpoint_alt,
-                    params={"token": apify_token},
-                    json={"videoUrl": video_url, "postURLs": [video_url], "maxComments": 100, "aweme_id": str(video_id)},
-                    timeout=60
-                )
-
-            if res.status_code not in (200, 201):
-                add_log(f"⚠️ Apify HTTP {res.status_code}: {res.text[:150]}")
-                break
-
-            items = res.json()
-            if not items:
-                break
-
-            page_comments = []
-            has_more = False
-            next_cursor = cursor + 50
-
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, dict) and "comments" in item and isinstance(item["comments"], list):
-                        page_comments.extend(item["comments"])
-                        has_more = item.get("has_more", item.get("hasMore", False))
-                        next_cursor = item.get("cursor", next_cursor)
-                    elif isinstance(item, dict) and ("text" in item or "cid" in item or "digg_count" in item):
-                        page_comments.append(item)
+            data = res.json()
+            c_data = data.get("data") or {}
+            page_comments = c_data.get("comments") or []
 
             if not page_comments:
                 break
 
             all_comments.extend(page_comments)
 
-            # Early-Stop: ako već imamo naš komentar SA REPLYEM, prekini listanje novih stranica!
             found_with_reply = any(
-                is_our_comment(c.get("text", c.get("comment", ""))) and
-                int(c.get("reply_comment_total", c.get("reply_total", c.get("replyCount", 0))) or 0) > 0
+                is_our_comment(str(c.get("text", "") or "")) and
+                int(c.get("reply_total", c.get("reply_comment_total", 0)) or 0) > 0
                 for c in all_comments
             )
             if found_with_reply:
                 break
 
-            if not has_more:
+            if not c_data.get("has_more"):
                 break
-            cursor = next_cursor
-
+            cursor = c_data.get("cursor", cursor + 50)
+            time.sleep(1.1)  # Poštujemo 1 req/sec limit besplatnog TikWM-a
         except Exception as e:
-            add_log(f"⚠️ Greška pri pozivu Apify-ja (stranica {page}): {e}")
+            add_log(f"⚠️ Greška na rezervnom skeneru: {e}")
             break
 
-    return all_comments
+    return all_comments, "TikWM Fallback"
 
 
 def send_likes_order(panel_url: str, api_key: str, service_id: str, video_link: str, username: str, quantity: int):
@@ -275,16 +333,18 @@ def worker_loop():
             continue
 
         add_log(f"🔍 Skeniram: {clean_url} (ID: {video_id})")
-        comments = fetch_comments_scraptik(video_id, clean_url, apify_token)
+        comments, source_used = fetch_comments_via_apify_or_fallback(video_id, clean_url, apify_token)
 
         with queue_lock:
             stats["scanned"] += 1
 
         if not comments:
-            add_log(f"❌ Nema učitanih komentara za {clean_url} (provjeri Apify token ili video).")
+            add_log(f"❌ Nema učitanih komentara za {clean_url} (video možda nema komentara ili je zaključan).")
             with queue_lock:
                 stats["failed"] += 1
             continue
+
+        add_log(f"📥 Učitano {len(comments)} komentara (Izvor: {source_used}). Analiziram...")
 
         max_likes = 0
         top_user = "nepoznato"
@@ -303,12 +363,10 @@ def worker_loop():
                 username = c.get("unique_id", c.get("user_unique_id", c.get("author", "")))
             username = str(username or "").lstrip("@")
 
-            # Pamti najjači komentar na videu
             if likes > max_likes:
                 max_likes = likes
                 top_user = username or "nepoznato"
 
-            # Provjera našeg komentara (čita kroz sve nevidljive znakove, tačkice i ćirilicu)
             if is_our_comment(text):
                 parsed_c = {
                     "username": username,
@@ -341,7 +399,7 @@ def worker_loop():
             target = first_keyword_no_reply
             match_type = "BEZ REPLYA (Prvi pronađeni sa keywordom)"
         else:
-            add_log(f"⚠️ Nije pronađen nijedan komentar sa Alversett keywordom (pregledano {len(comments)} kom).")
+            add_log(f"⚠️ Nije pronađen nijedan Alversett komentar među {len(comments)} učitanih komentara.")
             with queue_lock:
                 stats["skipped"] += 1
             continue
@@ -396,7 +454,7 @@ HTML_TEMPLATE = """
 <!doctype html>
 <html lang="bs">
 <head>
-  <title>🔥 TikTok Auto Comment Liker (x1.3) — Apify + SMMFrog</title>
+  <title>🔥 TikTok Auto Comment Liker (x1.3) — Dual Engine</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
@@ -420,15 +478,15 @@ HTML_TEMPLATE = """
     button { border: none; border-radius: 999px; padding: 10px 22px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
     .btn-primary { background: linear-gradient(135deg, #8b5cf6, #ec4899); color: white; box-shadow: 0 10px 25px rgba(139, 92, 246, 0.4); }
     .btn-danger { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.5); }
-    .log { margin-top: 10px; font-size: 12px; font-family: monospace; white-space: pre-wrap; background: rgba(10, 15, 30, 0.95); border-radius: 10px; padding: 14px; border: 1px solid rgba(55,65,81,0.9); height: 300px; overflow-y: auto; line-height: 1.5; }
+    .log { margin-top: 10px; font-size: 12px; font-family: monospace; white-space: pre-wrap; background: rgba(10, 15, 30, 0.95); border-radius: 10px; padding: 14px; border: 1px solid rgba(55,65,81,0.9); height: 320px; overflow-y: auto; line-height: 1.5; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="card">
-      <h1>🔥 TikTok Auto Comment Liker (x1.3) — Apify ScrapTik</h1>
+      <h1>🔥 TikTok Auto Comment Liker (x1.3) — Dual Engine</h1>
       <div class="subtitle">
-        Dekodira nevidljive znakove, tačkice i ćirilicu • Traži komentar sa replyem (ili prvi sa keywordom) • Šalje 1.3x od Top komentara
+        Apify ScrapTik + Automatski TikWM Fallback • Čita kroz nevidljive znakove i ćirilicu • Šalje 1.3x od Top komentara
       </div>
 
       <div class="status-banner">
@@ -455,7 +513,7 @@ HTML_TEMPLATE = """
 
       <div class="grid-2">
         <div>
-          <label>Apify API Token (apify_api_...):</label>
+          <label>Apify API Token (apify_api_... ili ostavi prazno za direktni TikWM):</label>
           <input type="password" id="apify_token" value="{{ default_apify }}" placeholder="Zalijepi svoj Apify Personal API Token...">
         </div>
         <div>
@@ -573,8 +631,6 @@ def add_tasks():
 
     links = [l.strip() for l in raw_links.splitlines() if l.strip()]
 
-    if not apify_token:
-        return jsonify({"error": "Unesi svoj Apify API Token!"})
     if not links:
         return jsonify({"error": "Unesi barem jedan TikTok link!"})
     if not test_mode and (not api_key or not service_id):
