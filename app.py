@@ -10,14 +10,12 @@ from flask import Flask, render_template_string, request, jsonify
 app = Flask(__name__)
 
 # =====================================================================
-# 🔧 DEFAULT KONFIGURACIJA
+# 🔧 KONFIGURACIJA ZA LAJKOVE (GodOfPanel)
 # =====================================================================
-# NAPOMENA: Ne stavljaj Apify token direktno u kod ako ga guraš na javni GitHub
-# jer će ga Apify odmah označiti kao "Leaked" i ugasiti! Unesi ga na webu ili u Railway Variables.
 DEFAULT_APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 DEFAULT_PANEL_URL = os.environ.get("PANEL_URL", "https://godofpanel.com/api/v2")
 DEFAULT_API_KEY = os.environ.get("API_KEY", "c4868df4a78299b800d222cd9478ba17")
-DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")
+DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")  # TikTok Comment Like na GodOfPanel
 
 # Pravila za lajkove
 MULTIPLIER = 1.30           # Šalje 1.3x više lajkova od top komentara
@@ -25,7 +23,7 @@ MAX_TOP_LIKES_LIMIT = 15000 # Ako prvi komentar ima preko 15.000 lajkova, ne ša
 FALLBACK_MIN_LIKES = 25     # Ako top komentar ima 0 lajkova, pošalji 25
 MAX_PAGES_PER_VIDEO = 12    # Maksimalno stranica po videu
 
-# Korijeni riječi (nakon čišćenja nevidljivih znakova, točkica i ćirilice)
+# Korijeni riječi (nakon čišćenja nevidljivih znakova, tačkica i ćirilice)
 CLEAN_ROOT_PATTERNS = [
     "alverset",      # Hvata: Alversett, Alverset, AIversett, Alver.sett, Alversettte, Alversette...
     "noraalver",     # Hvata: Nora Alversett, Nora.Alversett, N. Alversett...
@@ -62,7 +60,7 @@ def add_log(msg: str):
 
 
 def normalize_camouflaged_text(text: str) -> str:
-    """Skida sve nevidljive (zero-width) znakove, točkice i pretvara ćirilicu/homoglife u latinicu."""
+    """Skida sve nevidljive (zero-width) znakove, tačkice i pretvara ćirilicu/homoglife u latinicu."""
     if not text:
         return ""
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
@@ -165,14 +163,13 @@ def extract_comments_from_nested_json(data):
 
 def fetch_comments_multi_engine(video_id: str, video_url: str, apify_token: str):
     """
-    1. Poziva točan ScrapTik Comments Scraper API ('scraptik~tiktok-comments-scraper-api')
-       sa službenim poljem 'listComments_awemeId'.
+    1. Poziva službeni ScrapTik Comments Scraper API ('scraptik~tiktok-comments-scraper-api')
+       sa poljem 'listComments_awemeId'.
     2. Ako nije dostupan, proba glavni 'scraptik~tiktok-api'.
-    3. Ako Apify token ne radi (npr. Leaked token), automatski povlači preko TikWM API-ja.
+    3. Ako Apify vrati grešku, automatski povlači preko TikWM API-ja.
     """
     all_comments = []
 
-    # --- ENGINE 1: SLUŽBENI SCRAPTIK COMMENTS SCRAPER API ---
     if apify_token:
         actors_to_try = [
             "scraptik~tiktok-comments-scraper-api",
@@ -184,7 +181,6 @@ def fetch_comments_multi_engine(video_id: str, video_url: str, apify_token: str)
 
             for page in range(1, MAX_PAGES_PER_VIDEO + 1):
                 endpoint = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
-                # Službena ScrapTik polja: listComments_awemeId, listComments_count, listComments_cursor
                 payload = {
                     "listComments_awemeId": str(video_id),
                     "listComments_count": 50,
@@ -202,7 +198,7 @@ def fetch_comments_multi_engine(video_id: str, video_url: str, apify_token: str)
                         timeout=60
                     )
                     if res.status_code == 401:
-                        add_log("❌ [APIFY GREŠKA 401]: Tvoj Apify token je nevažeći ili ugašen jer je 'Leaked'! Kreiraj novi token na Apifyju.")
+                        add_log("❌ [APIFY GREŠKA 401]: Apify token je nevažeći ili ugašen!")
                         break
                     if res.status_code not in (200, 201):
                         if page == 1:
@@ -238,7 +234,7 @@ def fetch_comments_multi_engine(video_id: str, video_url: str, apify_token: str)
             if actor_success and all_comments:
                 return all_comments, f"Apify ({actor_id})"
 
-    # --- ENGINE 2: BESPLATNI REZERVNI SKENER (TikWM API) ---
+    # --- REZERVNI SKENER (TikWM API) ---
     add_log("🔄 Prebacujem na direktni TikWM skener komentara...")
     cursor = 0
     for page in range(1, MAX_PAGES_PER_VIDEO + 1):
@@ -333,7 +329,7 @@ def worker_loop():
             stats["scanned"] += 1
 
         if not comments:
-            add_log(f"❌ Nema učitanih komentara za {clean_url}. Provjeri da li si kreirao NOVI Apify token (stari je označen kao Leaked).")
+            add_log(f"❌ Nema učitanih komentara za {clean_url}.")
             with queue_lock:
                 stats["failed"] += 1
             continue
@@ -430,7 +426,7 @@ def worker_loop():
         else:
             ok, msg = send_likes_order(panel_url, api_key, service_id, clean_url, my_user, likes_to_send)
             if ok:
-                add_log(f"🚀 [POSLANO] +{likes_to_send} lajkova za @{my_user} -> {msg}")
+                add_log(f"🚀 [POSLANO NA GODOFPANEL] +{likes_to_send} lajkova za @{my_user} -> {msg}")
                 with queue_lock:
                     stats["ordered"] += 1
             else:
@@ -446,9 +442,9 @@ threading.Thread(target=worker_loop, daemon=True).start()
 
 HTML_TEMPLATE = """
 <!doctype html>
-<html lang="hr">
+<html lang="bs">
 <head>
-  <title>🔥 TikTok Auto Comment Liker (x1.3) — ScrapTik API</title>
+  <title>🔥 TikTok Auto Comment Liker (x1.3) — GodOfPanel</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
@@ -478,9 +474,9 @@ HTML_TEMPLATE = """
 <body>
   <div class="container">
     <div class="card">
-      <h1>🔥 TikTok Auto Comment Liker (x1.3) — ScrapTik API</h1>
+      <h1>🔥 TikTok Auto Comment Liker (x1.3) — GodOfPanel</h1>
       <div class="subtitle">
-        Službeni scraptik~tiktok-comments-scraper-api + TikWM Fallback • Dekodira kamuflažu • Šalje 1.3x
+        ScrapTik API + TikWM Fallback • Dekodira kamuflažu • Šalje 1.3x na GodOfPanel (Service #8771)
       </div>
 
       <div class="status-banner">
@@ -498,27 +494,31 @@ HTML_TEMPLATE = """
       </div>
 
       <div class="rules-box">
-        📌 <b>Važno:</b> Na Apify stranici klikni <b>+ Create a new token</b> (jer ti je stari označen kao <i>Leaked</i>) i zalijepi novi token ispod ili u Railway Variables pod <code>APIFY_TOKEN</code>!
+        📌 <b>Aktivna pravila:</b> 
+        1. Čita kroz sve nevidljive (zero-width) znakove, tačkice i ćirilične homoglife • 
+        2. Prioritet ima komentar sa replyem; ako nema replya, šalje na prvi pronađeni sa keywordom • 
+        3. Računa <b>Top Komentar × 1.3</b> (umanjeno za trenutne lajkove tvog komentara) • 
+        4. Ako Top komentar ima <b>preko 15.000 lajkova</b>, automatski preskače video.
       </div>
 
       <div class="grid-2">
         <div>
-          <label>Novi Apify Personal API Token (apify_api_...):</label>
-          <input type="password" id="apify_token" value="{{ default_apify }}" placeholder="Zalijepi NOVI Apify token...">
+          <label>Apify Personal API Token (apify_api_...):</label>
+          <input type="password" id="apify_token" value="{{ default_apify }}" placeholder="Zalijepi svoj Apify token...">
         </div>
         <div>
-          <label>Service ID za TikTok Comment Likes (SMMFrog):</label>
-          <input type="text" id="service_id" value="{{ default_service }}" placeholder="npr. 4125 (upiši ID servisa za lajkove komentara)">
+          <label>Service ID za TikTok Comment Likes (GodOfPanel):</label>
+          <input type="text" id="service_id" value="{{ default_service }}">
         </div>
       </div>
 
       <div class="grid-2">
         <div>
-          <label>SMM Panel API URL:</label>
+          <label>SMM Panel API URL (GodOfPanel):</label>
           <input type="text" id="panel_url" value="{{ default_panel_url }}">
         </div>
         <div>
-          <label>SMM Panel API Ključ:</label>
+          <label>SMM Panel API Ključ (GodOfPanel):</label>
           <input type="password" id="api_key" value="{{ default_api_key }}">
         </div>
       </div>
@@ -529,7 +529,7 @@ HTML_TEMPLATE = """
       <div class="btn-row">
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer; color:#fbbf24; font-size:13px; margin:0;">
           <input type="checkbox" id="test_mode" style="width:17px; height:17px;">
-          🧪 <b>TEST MOD</b> (Samo skeniraj i izračunaj u logu, ne šalji narudžbe na SMMFrog)
+          🧪 <b>TEST MOD</b> (Samo skeniraj i izračunaj u logu, ne šalji narudžbe na GodOfPanel)
         </label>
 
         <div style="display:flex; gap:10px;">
@@ -624,7 +624,7 @@ def add_tasks():
     if not links:
         return jsonify({"error": "Unesi barem jedan TikTok link!"})
     if not test_mode and (not api_key or not service_id):
-        return jsonify({"error": "Unesi SMMFrog API ključ i Service ID za Comment Likes (ili uključi Test Mod)!"})
+        return jsonify({"error": "Unesi GodOfPanel API ključ i Service ID (8771)!"})
 
     with queue_lock:
         for link in links:
