@@ -14,7 +14,7 @@ app = Flask(__name__)
 # =====================================================================
 DEFAULT_APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 DEFAULT_PANEL_URL = os.environ.get("PANEL_URL", "https://godofpanel.com/api/v2")
-DEFAULT_API_KEY = os.environ.get("API_KEY", "c4868df4a78299b800d222cd9478ba17")
+DEFAULT_API_KEY = os.environ.get("API_KEY", "ff9e106148468ef7b5639e9b46e2d2f4")
 DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")  # TikTok Comment Like na GodOfPanel
 
 # Pravila za lajkove
