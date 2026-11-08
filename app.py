@@ -15,9 +15,9 @@ app = Flask(__name__)
 # NAPOMENA: Ne stavljaj Apify token direktno u kod ako ga guraš na javni GitHub
 # jer će ga Apify odmah označiti kao "Leaked" i ugasiti! Unesi ga na webu ili u Railway Variables.
 DEFAULT_APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
-DEFAULT_PANEL_URL = os.environ.get("PANEL_URL", "https://smmfrog.com/api/v2")
-DEFAULT_API_KEY = os.environ.get("API_KEY", "15a158fe55e7c21be7de194ef97ebfa5")
-DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "")
+DEFAULT_PANEL_URL = os.environ.get("PANEL_URL", "https://godofpanel.com/api/v2")
+DEFAULT_API_KEY = os.environ.get("API_KEY", "c4868df4a78299b800d222cd9478ba17")
+DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")
 
 # Pravila za lajkove
 MULTIPLIER = 1.30           # Šalje 1.3x više lajkova od top komentara
