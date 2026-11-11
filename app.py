@@ -19,9 +19,31 @@ DEFAULT_LIKE_SERVICE_ID = os.environ.get("LIKE_SERVICE_ID", "8771")  # TikTok Co
 
 # Pravila za lajkove
 MULTIPLIER = 1.30           # Šalje 1.3x više lajkova od top komentara
-MAX_TOP_LIKES_LIMIT = 15000 # Ako prvi komentar ima preko 15.000 lajkova, ne šalje ništa
+MAX_TOP_LIKES_LIMIT = 12000 # Ako prvi komentar ima 12.000 ili više lajkova, ne šalje ništa
 FALLBACK_MIN_LIKES = 25     # Ako top komentar ima 0 lajkova, pošalji 25
 MAX_PAGES_PER_VIDEO = 12    # Maksimalno stranica po videu
+
+
+def calculate_target_likes(top_likes: int) -> int:
+    # 1. Sigurnosni limit - 12.000 ili više lajkova -> ne šalje ništa
+    if top_likes >= 12000:
+        return 0
+
+    # 2. Mali komentari (0 - 199): minimalno 150 ili trenutni + 80
+    if top_likes < 200:
+        return max(150, top_likes + 80)
+
+    # 3. Srednji komentari (200 - 999): dodaj 35% prednosti
+    if top_likes < 1000:
+        return int(top_likes * 1.35)
+
+    # 4. Jači komentari (1.000 - 2.999): dodaj 600 lajkova prednosti
+    if top_likes < 3000:
+        return top_likes + 600
+
+    # 5. Vrlo jaki komentari (3.000 - 11.999): dodaj 1.000 lajkova prednosti (npr. 10k -> 11k)
+    return top_likes + 1000
+
 
 # Korijeni riječi (nakon čišćenja nevidljivih znakova, tačkica i ćirilice)
 CLEAN_ROOT_PATTERNS = [
@@ -369,11 +391,12 @@ def worker_loop():
                 elif first_keyword_no_reply is None:
                     first_keyword_no_reply = parsed_c
 
-        # 1. PRAVILO: Ako najjači komentar ima preko 15.000 lajkova -> NE ŠALJI NIŠTA
-        if max_likes > MAX_TOP_LIKES_LIMIT:
+        # 1. PRAVILO: Ako najjači komentar ima 12.000 ili više lajkova -> NE ŠALJI NIŠTA
+        desired_total = calculate_target_likes(max_likes)
+        if desired_total == 0:
             add_log(
                 f"⏭️ [PRESKOČENO] Top komentar (@{top_user}) ima {max_likes} lajkova "
-                f"(preko limita od {MAX_TOP_LIKES_LIMIT}). Ne šaljem ništa."
+                f"(limit je {MAX_TOP_LIKES_LIMIT}). Ne šaljem ništa."
             )
             with queue_lock:
                 stats["skipped"] += 1
@@ -398,19 +421,12 @@ def worker_loop():
         my_likes = target["likes"]
         my_text_short = (target["text"][:55] + "...") if len(target["text"]) > 55 else target["text"]
 
-        # 3. PRAVILO: Top lajkovi * 1.3
-        if max_likes == 0:
-            desired_total = FALLBACK_MIN_LIKES
-        else:
-            desired_total = int(round(max_likes * MULTIPLIER))
-            if desired_total <= max_likes:
-                desired_total = max_likes + 10
-
+        # 3. PRAVILO: Izračunaj koliko lajkova treba poslati do ciljanog broja
         likes_to_send = desired_total - my_likes
 
         add_log(
             f"🎯 Pronađen @{my_user} [{match_type}] | Trenutno: {my_likes} lajkova | "
-            f"Top kom (@{top_user}): {max_likes} lajkova | Cilj (x1.3): {desired_total}"
+            f"Top kom (@{top_user}): {max_likes} lajkova | Cilj: {desired_total}"
         )
 
         if likes_to_send <= 0:
@@ -444,7 +460,7 @@ HTML_TEMPLATE = """
 <!doctype html>
 <html lang="bs">
 <head>
-  <title>🔥 TikTok Auto Comment Liker (x1.3) — GodOfPanel</title>
+  <title>🔥 TikTok Auto Comment Liker — GodOfPanel</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
@@ -497,8 +513,8 @@ HTML_TEMPLATE = """
         📌 <b>Aktivna pravila:</b> 
         1. Čita kroz sve nevidljive (zero-width) znakove, tačkice i ćirilične homoglife • 
         2. Prioritet ima komentar sa replyem; ako nema replya, šalje na prvi pronađeni sa keywordom • 
-        3. Računa <b>Top Komentar × 1.3</b> (umanjeno za trenutne lajkove tvog komentara) • 
-        4. Ako Top komentar ima <b>preko 15.000 lajkova</b>, automatski preskače video.
+        3. Dinamičko računanje cilja (0-199: min 150 ili +80 | 200-999: ×1.35 | 1k-3k: +600 | 3k-12k: +1000) • 
+        4. Ako Top komentar ima <b>12.000 ili više lajkova</b>, automatski preskače video.
       </div>
 
       <div class="grid-2">
